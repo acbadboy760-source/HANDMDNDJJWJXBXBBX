@@ -1,20 +1,20 @@
-name: VisionGuard Vulnerability Scanner
+name: VisionGuard God Mode Scanner
 
 on:
   workflow_dispatch:
     inputs:
       target:
-        description: 'Target URL (https://example.com)'
+        description: 'Target domain (example.com)'
         required: true
-      scan_type:
-        description: 'Scan Type'
+      depth:
+        description: 'Scan Depth'
         required: true
-        default: 'full'
+        default: 'deep'
         type: choice
         options:
           - quick
+          - deep
           - full
-          - passive
 
 permissions:
   contents: write
@@ -25,327 +25,332 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Environment
+      - name: 📦 Cache Nuclei Templates
+        uses: actions/cache@v4
+        with:
+          path: ~/nuclei-templates
+          key: nuclei-templates-${{ runner.os }}-1
+
+      - name: 🔧 Install All Tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3-pip
-          pip3 install aiohttp rich requests beautifulsoup4
+          sudo apt-get install -y nmap python3-pip
+          pip3 install rich requests beautifulsoup4 lxml
 
-      - name: Run VisionGuard Scanner
+          # Subfinder
+          curl -L https://github.com/projectdiscovery/subfinder/releases/download/v2.6.6/subfinder_2.6.6_linux_amd64.zip -o subfinder.zip
+          unzip -o subfinder.zip -d /tmp && sudo mv /tmp/subfinder /usr/local/bin/ && rm subfinder.zip
+
+          # Httpx
+          curl -L https://github.com/projectdiscovery/httpx/releases/download/v1.6.0/httpx_1.6.0_linux_amd64.zip -o httpx.zip
+          unzip -o httpx.zip -d /tmp && sudo mv /tmp/httpx /usr/local/bin/ && rm httpx.zip
+
+          # Nuclei
+          curl -L https://github.com/projectdiscovery/nuclei/releases/download/v3.2.0/nuclei_3.2.0_linux_amd64.zip -o nuclei.zip
+          unzip -o nuclei.zip -d /tmp && sudo mv /tmp/nuclei /usr/local/bin/ && rm nuclei.zip
+
+          # Nuclei Templates (if not cached)
+          if [ ! -d ~/nuclei-templates ]; then
+            nuclei -ut -ud ~/nuclei-templates
+          fi
+
+      - name: 🚀 Execute God Mode Scan
         env:
-          TARGET_URL: ${{ github.event.inputs.target }}
-          SCAN_TYPE: ${{ github.event.inputs.scan_type }}
+          TARGET_DOMAIN: ${{ github.event.inputs.target }}
+          SCAN_DEPTH: ${{ github.event.inputs.depth }}
         run: |
           python3 << 'PYEOF'
-          import os, sys, time, json, re
+          import os, sys, time, json, re, subprocess, threading
           from datetime import datetime
+          from urllib.parse import urlparse
           from rich.console import Console
           from rich.table import Table
-          from rich.live import Live
           from rich.panel import Panel
-          from rich.progress import Progress
+          from rich.live import Live
+          from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn
           import requests
-          from urllib.parse import urlparse, parse_qs, urljoin
 
           console = Console()
-          TARGET = os.environ["TARGET_URL"]
-          SCAN_TYPE = os.environ["SCAN_TYPE"]
+          TARGET = os.environ["TARGET_DOMAIN"].strip().rstrip('/')
+          DEPTH = os.environ["SCAN_DEPTH"]
           REPORT_FILE = "vulnerability_report.txt"
+          TEMPLATES_DIR = os.path.expanduser("~/nuclei-templates")
 
-          # ===== ۱. پایگاه دانش راه‌حل‌ها =====
-          FIXES_DB = {
-              "sql_injection": {
-                  "severity": "Critical",
-                  "description": "SQL Injection vulnerability detected",
-                  "owasp": "A03:2021 – Injection",
-                  "fix": """🔧 HOW TO FIX SQL INJECTION:
-          1. Use Parameterized Queries (Prepared Statements)
-          2. Use ORM frameworks (SQLAlchemy, Django ORM)
-          3. Implement Input Validation (whitelist approach)
-          4. Apply Least Privilege Principle to DB accounts
-          5. Use WAF (Web Application Firewall)
-          Example (Python):
-            cursor.execute("SELECT * FROM users WHERE id = ?", (user_id,))"""
-              },
-              "xss": {
-                  "severity": "High",
-                  "description": "Cross-Site Scripting (XSS) vulnerability",
-                  "owasp": "A03:2021 – Injection",
-                  "fix": """🔧 HOW TO FIX XSS:
-          1. Encode output (HTML Entity Encoding)
-          2. Use Content-Security-Policy (CSP) header
-          3. Implement input validation
-          4. Use frameworks with auto-escaping (React, Angular)
-          5. Set HttpOnly & Secure flags on cookies
-          Example (Python Flask):
-            {{ user_input|e }}  <!-- auto-escape in Jinja2 -->"""
-              },
-              "csrf": {
-                  "severity": "High",
-                  "description": "Cross-Site Request Forgery vulnerability",
-                  "owasp": "A01:2021 – Broken Access Control",
-                  "fix": """🔧 HOW TO FIX CSRF:
-          1. Implement CSRF Tokens in all forms
-          2. Use SameSite Cookie Attribute (Strict/Lax)
-          3. Verify Origin/Referer headers
-          4. Require re-authentication for sensitive actions
-          Example (Python Flask):
-            from flask_wtf.csrf import CSRFProtect
-            csrf = CSRFProtect(app)"""
-              },
-              "missing_security_headers": {
-                  "severity": "Medium",
-                  "description": "Missing HTTP Security Headers",
-                  "owasp": "A05:2021 – Security Misconfiguration",
-                  "fix": """🔧 HOW TO FIX MISSING SECURITY HEADERS:
-          1. Add HSTS header: Strict-Transport-Security
-          2. Add X-Content-Type-Options: nosniff
-          3. Add X-Frame-Options: DENY or SAMEORIGIN
-          4. Add Content-Security-Policy header
-          5. Add Referrer-Policy header"""
-              },
-              "open_redirect": {
-                  "severity": "Medium",
-                  "description": "Open Redirect vulnerability",
-                  "owasp": "A01:2021 – Broken Access Control",
-                  "fix": """🔧 HOW TO FIX OPEN REDIRECT:
-          1. Avoid user-controlled redirect URLs
-          2. Use a whitelist of allowed redirect URLs
-          3. Use relative paths instead of absolute URLs
-          4. Implement redirect validation with URL parsing"""
-              },
-              "sensitive_info": {
-                  "severity": "Low",
-                  "description": "Sensitive Information Exposure",
-                  "owasp": "A04:2021 – Insecure Design",
-                  "fix": """🔧 HOW TO FIX SENSITIVE INFO EXPOSURE:
-          1. Remove debug/error pages in production
-          2. Disable server signature (Server header)
-          3. Mask/remove sensitive data from responses
-          4. Implement proper error handling"""
-              }
+          # حذف پروتکل از دامنه
+          if TARGET.startswith('http'):
+              TARGET = urlparse(TARGET).netloc
+
+          FINDINGS = []
+          LIVE_URLS = []
+          ALL_SUBDOMAINS = []
+
+          # ===== پایگاه دانش پیشرفته راه‌حل‌ها =====
+          FIXES = {
+              "sqli": {"severity":"Critical","owasp":"A03:2021 – Injection","desc":"SQL Injection","fix":"1. Use Parameterized Queries\n2. ORM (SQLAlchemy, Django)\n3. Input validation (whitelist)\n4. Least privilege DB user"},
+              "xss": {"severity":"High","owasp":"A03:2021 – Injection","desc":"Cross-Site Scripting","fix":"1. Output encoding (HTML entities)\n2. CSP header\n3. Framework auto-escaping\n4. HttpOnly cookies"},
+              "ssrf": {"severity":"Critical","owasp":"A10:2021 – SSRF","desc":"Server-Side Request Forgery","fix":"1. URL whitelist\n2. Block internal IPs\n3. Disable HTTP redirections\n4. Validate protocol"},
+              "ssti": {"severity":"Critical","owasp":"A03:2021 – Injection","desc":"Template Injection","fix":"1. Avoid user input in templates\n2. Use sandboxed templates\n3. Escape template syntax\n4. Use logic-less templates"},
+              "idor": {"severity":"High","owasp":"A01:2021 – Broken Access","desc":"Insecure Direct Object Reference","fix":"1. Use UUID instead of sequential IDs\n2. Verify ownership per request\n3. Implement access control lists"},
+              "rce": {"severity":"Critical","owasp":"A03:2021 – Injection","desc":"Remote Code Execution","fix":"1. Never eval() user input\n2. Disable dangerous functions\n3. Use allowlists for commands\n4. Run in sandbox"},
+              "exposed_env": {"severity":"Critical","owasp":"A05:2021 – Misconfig","desc":".env File Exposed","fix":"1. Block access to dotfiles\n2. Store secrets in vault\n3. Use environment variables at OS level"},
+              "exposed_git": {"severity":"High","owasp":"A05:2021 – Misconfig","desc":".git Directory Exposed","fix":"1. Block .git/ in server config\n2. Use .gitignore on server\n3. Deploy with CI/CD not git clone"},
+              "exposed_config": {"severity":"High","owasp":"A05:2021 – Misconfig","desc":"Config File Exposed","fix":"1. Move configs outside webroot\n2. Block access to .conf, .ini, .yaml\n3. Use config management"},
+              "open_redirect": {"severity":"Medium","owasp":"A01:2021 – Broken Access","desc":"Open Redirect","fix":"1. Whitelist redirect URLs\n2. Use relative paths\n3. Validate URL before redirect"},
+              "missing_headers": {"severity":"Medium","owasp":"A05:2021 – Misconfig","desc":"Missing Security Headers","fix":"Add: HSTS, X-Content-Type-Options, X-Frame-Options, CSP, Referrer-Policy"},
+              "cors_misconfig": {"severity":"Medium","owasp":"A05:2021 – Misconfig","desc":"CORS Misconfiguration","fix":"1. Don't use Access-Control-Allow-Origin: *\n2. Validate Origin header\n3. Whitelist trusted domains"},
+              "cve": {"severity":"Critical","owasp":"A06:2021 – Vulnerable Components","desc":"Known CVE Detected","fix":"1. Update to patched version\n2. Check vendor advisory\n3. Apply security patches\n4. Use vulnerability scanner regularly"},
           }
 
-          # ===== ۲. اسکنر =====
-          class VisionGuardScanner:
-              def __init__(self, target_url):
-                  self.target = target_url.rstrip('/')
-                  self.parsed = urlparse(self.target)
-                  self.base = f"{self.parsed.scheme}://{self.parsed.netloc}"
-                  self.findings = []
-                  self.session = requests.Session()
-                  self.session.headers.update({
-                      "User-Agent": "VisionGuard/1.0 (Security Scanner - Authorized Testing Only)"
-                  })
+          def add_finding(ftype, detail, evidence="", url=""):
+              FINDINGS.append({"type":ftype, "detail":detail, "evidence":str(evidence)[:200], "url":url or TARGET})
 
-              def check_security_headers(self):
-                  """Check for missing security headers"""
-                  try:
-                      resp = self.session.get(self.target, timeout=10, allow_redirects=True)
-                      headers = resp.headers
-                      checks = {
-                          "Strict-Transport-Security": "HSTS not enforced",
-                          "X-Content-Type-Options": "Missing X-Content-Type-Options",
-                          "X-Frame-Options": "Missing clickjacking protection",
-                          "Content-Security-Policy": "Missing CSP header",
-                          "Referrer-Policy": "Missing Referrer-Policy"
-                      }
-                      for header, issue in checks.items():
-                          if header not in headers:
-                              self.findings.append({
-                                  "type": "missing_security_headers",
-                                  "url": self.target,
-                                  "detail": f"Missing header: {header} ({issue})",
-                                  "evidence": f"Response headers: {dict(headers)}"
-                              })
-                  except Exception as e:
-                      console.print(f"[red]✗ Failed to check headers: {e}[/red]")
+          # ========== ۱. فاز شناسایی ==========
+          console.print(Panel.fit("[bold yellow]🕵️ Phase 1: Reconnaissance[/bold yellow]", border_style="yellow"))
 
-              def check_sqli(self):
-                  """Quick SQLi check on query parameters"""
-                  test_payloads = ["'", "\"", "1 OR 1=1", "' OR '1'='1"]
-                  try:
-                      resp = self.session.get(self.target, timeout=10)
-                      if '?' in self.target:
-                          base_url = self.target.split('?')[0]
-                          params = parse_qs(urlparse(self.target).query)
-                          for param in params:
-                              for payload in test_payloads[:2]:  # Quick check only
-                                  test_params = params.copy()
-                                  test_params[param] = [payload]
-                                  test_resp = self.session.get(base_url, params=test_params, timeout=10)
-                                  for error in ['sql', 'mysql', 'syntax', 'database', 'ORA-', 'SQLite']:
-                                      if error.lower() in test_resp.text.lower():
-                                          self.findings.append({
-                                              "type": "sql_injection",
-                                              "url": self.target,
-                                              "detail": f"Potential SQLi in parameter '{param}'",
-                                              "evidence": f"Payload: {payload} → SQL error detected"
-                                          })
-                                          break
-                  except:
-                      pass
+          # Subfinder
+          if DEPTH in ("deep","full"):
+              console.print("[cyan]→ Subfinder: discovering subdomains...[/cyan]")
+              try:
+                  result = subprocess.run(["subfinder", "-d", TARGET, "-silent", "-timeout", "30"],
+                                          capture_output=True, text=True, timeout=60)
+                  ALL_SUBDOMAINS = [s.strip() for s in result.stdout.splitlines() if s.strip()]
+                  console.print(f"[green]✓ Found {len(ALL_SUBDOMAINS)} subdomains[/green]")
+              except Exception as e:
+                  console.print(f"[red]✗ Subfinder failed: {e}[/red]")
+                  ALL_SUBDOMAINS = [TARGET]
 
-              def check_xss(self):
-                  """Quick XSS check on reflected params"""
-                  test_payload = "<script>alert('XSS')</script>"
-                  try:
-                      resp = self.session.get(self.target, timeout=10)
-                      if '?' in self.target:
-                          base_url = self.target.split('?')[0]
-                          params = parse_qs(urlparse(self.target).query)
-                          for param in params:
-                              test_resp = self.session.get(f"{base_url}?{param}={test_payload}", timeout=10)
-                              if test_payload in test_resp.text:
-                                  self.findings.append({
-                                      "type": "xss",
-                                      "url": self.target,
-                                      "detail": f"Reflected XSS in parameter '{param}'",
-                                      "evidence": f"Payload reflected in response"
-                                  })
-                  except:
-                      pass
+          # Nmap
+          if DEPTH in ("deep","full"):
+              console.print("[cyan]→ Nmap: scanning common ports...[/cyan]")
+              try:
+                  result = subprocess.run(["nmap", "-sT", "-sV", "-p", "1-10000", "--min-rate", "5000", TARGET],
+                                          capture_output=True, text=True, timeout=120)
+                  for line in result.stdout.splitlines():
+                      if "/tcp" in line and "open" in line:
+                          add_finding("port_open", f"Open port: {line.strip()}", line.strip())
+              except Exception as e:
+                  console.print(f"[red]✗ Nmap failed: {e}[/red]")
 
-              def check_open_redirect(self):
-                  """Check for open redirect"""
-                  test_urls = ["https://evil.com", "//evil.com", "https:evil.com"]
-                  try:
-                      resp = self.session.get(self.target, timeout=10)
-                      if '?' in self.target:
-                          base_url = self.target.split('?')[0]
-                          params = parse_qs(urlparse(self.target).query)
-                          redirect_params = ['redirect', 'url', 'next', 'return', 'goto', 'callback', 'target']
-                          for param in redirect_params:
-                              for test_url in test_urls:
-                                  test_resp = self.session.get(f"{base_url}?{param}={test_url}", 
-                                                              timeout=10, allow_redirects=False)
-                                  if test_resp.status_code in (301, 302, 303, 307, 308):
-                                      location = test_resp.headers.get('Location', '')
-                                      if 'evil.com' in location:
-                                          self.findings.append({
-                                              "type": "open_redirect",
-                                              "url": self.target,
-                                              "detail": f"Open Redirect in parameter '{param}'",
-                                              "evidence": f"Redirected to: {location}"
-                                          })
-                  except:
-                      pass
+          # Httpx
+          all_targets = [TARGET] + ALL_SUBDOMAINS[:30]  # Limit subdomains
+          console.print("[cyan]→ Httpx: probing live URLs...[/cyan]")
+          try:
+              with open("/tmp/targets.txt","w") as f:
+                  f.write("\n".join(all_targets))
+              result = subprocess.run(["httpx", "-l", "/tmp/targets.txt", "-silent", "-status-code", "-title", "-tech-detect"],
+                                      capture_output=True, text=True, timeout=60)
+              for line in result.stdout.splitlines():
+                  if line.startswith("http"):
+                      LIVE_URLS.append(line.split()[0])
+                      console.print(f"[dim]  {line}[/dim]")
+              console.print(f"[green]✓ {len(LIVE_URLS)} live URLs[/green]")
+          except Exception as e:
+              console.print(f"[red]✗ Httpx failed: {e}[/red]")
+              LIVE_URLS = [f"https://{TARGET}"]
 
-              def check_sensitive_info(self):
-                  """Check for exposed sensitive info"""
-                  sensitive_patterns = {
-                      r'password\s*=\s*["\'][^"\']+["\']': 'Hardcoded password',
-                      r'API[_\s]?KEY\s*=\s*["\'][^"\']+["\']': 'Exposed API key',
-                      r'BEGIN RSA PRIVATE KEY': 'Private key exposed',
-                  }
-                  try:
-                      resp = self.session.get(self.target, timeout=10)
-                      for pattern, desc in sensitive_patterns.items():
-                          if re.search(pattern, resp.text, re.IGNORECASE):
-                              self.findings.append({
-                                  "type": "sensitive_info",
-                                  "url": self.target,
-                                  "detail": f"Sensitive data: {desc}",
-                                  "evidence": f"Pattern matched in response body"
-                              })
-                  except:
-                      pass
+          # ========== ۲. فاز اسکن ==========
+          console.print(Panel.fit("[bold yellow]⚡ Phase 2: Vulnerability Scanning[/bold yellow]", border_style="yellow"))
 
-              def run_full_scan(self):
-                  console.print(f"\n[bold cyan]🔍 VisionGuard scanning: {self.target}[/bold cyan]\n")
-                  with Progress() as progress:
-                      task = progress.add_task("[cyan]Scanning...", total=6)
-                      
-                      self.check_security_headers()
-                      progress.update(task, advance=1, description="[green]✓ Security Headers")
-                      
-                      self.check_sqli()
-                      progress.update(task, advance=1, description="[green]✓ SQL Injection")
-                      
-                      self.check_xss()
-                      progress.update(task, advance=1, description="[green]✓ XSS")
-                      
-                      self.check_open_redirect()
-                      progress.update(task, advance=1, description="[green]✓ Open Redirect")
-                      
-                      self.check_sensitive_info()
-                      progress.update(task, advance=1, description="[green]✓ Sensitive Info")
-                      
-                      progress.update(task, advance=1, description="[bold green]✅ Scan Complete!")
-
-              def generate_report(self):
-                  """Generate and display findings with fixes"""
-                  console.print("\n")
+          # Nuclei
+          if LIVE_URLS:
+              console.print(f"[cyan]→ Nuclei: running 1000+ templates...[/cyan]")
+              url_file = "/tmp/live_urls.txt"
+              with open(url_file,"w") as f:
+                  f.write("\n".join(LIVE_URLS[:10]))  # Limit to top 10 for speed
+              try:
+                  result = subprocess.run([
+                      "nuclei", "-l", url_file,
+                      "-t", TEMPLATES_DIR,
+                      "-severity", "critical,high,medium",
+                      "-timeout", "10",
+                      "-silent",
+                      "-json",
+                      "-stats-interval", "30"
+                  ], capture_output=True, text=True, timeout=300)
                   
-                  if not self.findings:
-                      console.print(Panel.fit(
-                          "[bold green]✅ No vulnerabilities found![/bold green]\n"
-                          "The target appears to be secure against common attacks.",
-                          title="Scan Result", border_style="green"
-                      ))
-                  else:
-                      table = Table(title="🛡️ Vulnerability Report", show_header=True,
-                                   header_style="bold white")
-                      table.add_column("#", style="dim")
-                      table.add_column("Type", style="cyan")
-                      table.add_column("Severity")
-                      table.add_column("Detail")
-                      table.add_column("Fix Available")
+                  for line in result.stdout.splitlines():
+                      try:
+                          ndata = json.loads(line)
+                          template_name = ndata.get("template-id","")
+                          ntype = ndata.get("info",{}).get("classification",{}).get("cwe-id","")
+                          severity = ndata.get("info",{}).get("severity","info")
+                          description = ndata.get("info",{}).get("description","")
+                          matched_url = ndata.get("matched-at","")
 
-                      for i, f in enumerate(self.findings, 1):
-                          fix_info = FIXES_DB.get(f['type'], {})
-                          severity = fix_info.get('severity', 'Unknown')
-                          severity_color = {
-                              "Critical": "red", "High": "red", "Medium": "yellow", "Low": "green"
-                          }.get(severity, "white")
-                          table.add_row(
-                              str(i),
-                              f['type'].replace('_', ' ').title(),
-                              f"[{severity_color}]{severity}[/{severity_color}]",
-                              f['detail'][:60],
-                              "✅ Yes" if fix_info else "❌ No"
-                          )
-                      console.print(table)
+                          # Map template to fix
+                          fix_type = template_name
+                          if "sql" in template_name.lower():
+                              fix_type = "sqli"
+                          elif "xss" in template_name.lower():
+                              fix_type = "xss"
+                          elif "ssrf" in template_name.lower():
+                              fix_type = "ssrf"
+                          elif "ssti" in template_name.lower():
+                              fix_type = "ssti"
+                          elif "idor" in template_name.lower():
+                              fix_type = "idor"
+                          elif "rce" in template_name.lower():
+                              fix_type = "rce"
+                          elif "env" in template_name.lower():
+                              fix_type = "exposed_env"
+                          elif "git" in template_name.lower():
+                              fix_type = "exposed_git"
+                          elif "config" in template_name.lower():
+                              fix_type = "exposed_config"
+                          elif "cve" in template_name.lower():
+                              fix_type = "cve"
+                          elif "cors" in template_name.lower():
+                              fix_type = "cors_misconfig"
+                          else:
+                              fix_type = "missing_headers"
 
-                      # نمایش راه‌حل‌ها
-                      console.print("\n[bold yellow]🔧 REMEDIATION GUIDE[/bold yellow]")
-                      for i, f in enumerate(self.findings, 1):
-                          fix_info = FIXES_DB.get(f['type'])
-                          if fix_info:
-                              console.print(f"\n[bold cyan]━━━ #{i}: {f['type'].replace('_',' ').title()} ({fix_info['severity']})[/bold cyan]")
-                              console.print(f"[dim]OWASP: {fix_info['owasp']}[/dim]")
-                              console.print(f"[green]{fix_info['fix']}[/green]")
+                          add_finding(fix_type, f"[Nuclei] {description}", f"Template: {template_name}", matched_url)
+                      except:
+                          pass
+                  console.print(f"[green]✓ Nuclei scan completed[/green]")
+              except Exception as e:
+                  console.print(f"[red]✗ Nuclei failed: {e}[/red]")
 
-                  # ذخیره گزارش
-                  with open(REPORT_FILE, 'w') as rf:
-                      rf.write(f"VisionGuard Vulnerability Report\n")
-                      rf.write(f"Target: {TARGET}\n")
-                      rf.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
-                      rf.write(f"Findings: {len(self.findings)}\n")
-                      rf.write("="*50 + "\n")
-                      for f in self.findings:
-                          fix = FIXES_DB.get(f['type'], {})
-                          rf.write(f"\nType: {f['type']}\n")
-                          rf.write(f"Severity: {fix.get('severity','Unknown')}\n")
-                          rf.write(f"Detail: {f['detail']}\n")
-                          rf.write(f"Evidence: {f['evidence']}\n")
-                          rf.write(f"Fix:\n{fix.get('fix','No fix available')}\n")
-                          rf.write("-"*40 + "\n")
+          # ========== ۳. فاز تست‌های دستی پیشرفته ==========
+          console.print(Panel.fit("[bold yellow]🔍 Phase 3: Advanced Manual Checks[/bold yellow]", border_style="yellow"))
 
-                  os.system(f"git add {REPORT_FILE} && git commit -m 'Vulnerability scan report for {TARGET}' && git push 2>/dev/null || true")
-                  console.print(f"\n[green]📄 Full report saved to {REPORT_FILE}[/green]")
+          session = requests.Session()
+          session.headers.update({"User-Agent": "VisionGuard/2.0 (Authorized Security Testing)"})
 
-          scanner = VisionGuardScanner(TARGET)
-          
-          if SCAN_TYPE == 'quick':
-              scanner.check_security_headers()
-              scanner.check_sqli()
-          elif SCAN_TYPE == 'full':
-              scanner.run_full_scan()
-          elif SCAN_TYPE == 'passive':
-              scanner.check_security_headers()
-              scanner.check_sensitive_info()
+          # SQLi Time-based blind
+          for url in LIVE_URLS[:5]:
+              if '?' in url:
+                  parsed = urlparse(url)
+                  params = parsed.query.split('&')
+                  for param in params:
+                      if '=' in param:
+                          pname = param.split('=')[0]
+                          payloads = [f"{pname}=1' AND SLEEP(5)--", f"{pname}=1'; WAITFOR DELAY '0:0:5'--"]
+                          for pl in payloads:
+                              try:
+                                  test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{pl}"
+                                  start = time.time()
+                                  session.get(test_url, timeout=15)
+                                  elapsed = time.time() - start
+                                  if elapsed > 4.5:
+                                      add_finding("sqli", f"Time-based SQLi in '{pname}'", f"Response delay: {elapsed:.1f}s", url)
+                                      break
+                              except:
+                                  pass
 
-          scanner.generate_report()
-          console.print("\n[bold green]✅ VisionGuard scan completed![/bold green]")
+          # XSS advanced
+          xss_payloads = [
+              "<img src=x onerror=alert(1)>",
+              "\"><svg onload=alert(1)>",
+              "javascript:alert(1)"
+          ]
+          for url in LIVE_URLS[:5]:
+              try:
+                  r = session.get(url, timeout=10)
+                  if '?' in url:
+                      parsed = urlparse(url)
+                      params = parsed.query.split('&')
+                      for param in params:
+                          if '=' in param:
+                              pname = param.split('=')[0]
+                              for payload in xss_payloads[:2]:
+                                  test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{pname}={payload}"
+                                  resp = session.get(test_url, timeout=10)
+                                  if payload in resp.text:
+                                      add_finding("xss", f"Reflected XSS in '{pname}'", payload, url)
+                                      break
+              except:
+                  pass
+
+          # SSTI check
+          ssti_payloads = ["{{7*7}}", "${7*7}", "<%=7*7%>"]
+          for url in LIVE_URLS[:3]:
+              try:
+                  parsed = urlparse(url)
+                  if parsed.query:
+                      for param in [p.split('=')[0] for p in parsed.query.split('&') if '=' in p]:
+                          for pl in ssti_payloads[:1]:
+                              test_url = f"{parsed.scheme}://{parsed.netloc}{parsed.path}?{param}={pl}"
+                              r = session.get(test_url, timeout=10)
+                              if "49" in r.text:
+                                  add_finding("ssti", f"Potential SSTI in '{param}'", pl, url)
+                                  break
+              except:
+                  pass
+
+          # .env / .git exposure
+          for url in LIVE_URLS[:5]:
+              for sensitive_path in ["/.env", "/.git/HEAD", "/config.json", "/wp-config.php.bak"]:
+                  try:
+                      r = session.get(url.rstrip('/') + sensitive_path, timeout=10, allow_redirects=False)
+                      if r.status_code == 200 and len(r.text) > 10:
+                          if sensitive_path.endswith(".env"):
+                              add_finding("exposed_env", f"Exposed {sensitive_path}", f"Status: {r.status_code}, Size: {len(r.text)}", url)
+                          elif ".git" in sensitive_path:
+                              add_finding("exposed_git", f"Exposed {sensitive_path}", f"Status: {r.status_code}", url)
+                          else:
+                              add_finding("exposed_config", f"Exposed {sensitive_path}", f"Status: {r.status_code}", url)
+                  except:
+                      pass
+
+          # ========== ۴. گزارش نهایی ==========
+          console.print(Panel.fit("[bold yellow]📊 Phase 4: Report Generation[/bold yellow]", border_style="yellow"))
+
+          if not FINDINGS:
+              console.print(Panel.fit("[bold green]✅ No vulnerabilities found![/bold green]", title="Result", border_style="green"))
+          else:
+              # جدول یافته‌ها
+              tbl = Table(title=f"🛡️ VisionGuard God Mode Report – {TARGET}", show_header=True, header_style="bold white")
+              tbl.add_column("#", style="dim")
+              tbl.add_column("Type", style="cyan")
+              tbl.add_column("Severity")
+              tbl.add_column("Detail")
+              tbl.add_column("URL")
+
+              for i, f in enumerate(FINDINGS, 1):
+                  fix = FIXES.get(f['type'], {})
+                  sev = fix.get('severity', 'Unknown')
+                  sev_color = "red" if sev in ("Critical","High") else "yellow" if sev == "Medium" else "green"
+                  tbl.add_row(
+                      str(i),
+                      f['type'].replace('_',' ').title(),
+                      f"[{sev_color}]{sev}[/{sev_color}]",
+                      f['detail'][:70],
+                      f.get('url', TARGET)[:50]
+                  )
+              console.print(tbl)
+
+              # راه‌حل‌ها
+              console.print("\n[bold yellow]🔧 REMEDIATION GUIDE[/bold yellow]")
+              shown_types = set()
+              for i, f in enumerate(FINDINGS, 1):
+                  fix = FIXES.get(f['type'])
+                  if fix and f['type'] not in shown_types:
+                      shown_types.add(f['type'])
+                      console.print(f"\n[bold cyan]━━━ {fix['desc']} ({fix['severity']})[/bold cyan]")
+                      console.print(f"[dim]OWASP: {fix['owasp']}[/dim]")
+                      console.print(f"[green]{fix['fix']}[/green]")
+
+              # ذخیره فایل
+              with open(REPORT_FILE, 'w') as rf:
+                  rf.write(f"VisionGuard God Mode Report\n")
+                  rf.write(f"Target: {TARGET}\n")
+                  rf.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+                  rf.write(f"Total Findings: {len(FINDINGS)}\n")
+                  rf.write("="*60 + "\n")
+                  for i, f in enumerate(FINDINGS, 1):
+                      fix = FIXES.get(f['type'], {})
+                      rf.write(f"\n#{i}: {fix.get('desc','Unknown')}\n")
+                      rf.write(f"Type: {f['type']}\n")
+                      rf.write(f"Severity: {fix.get('severity','Unknown')}\n")
+                      rf.write(f"Detail: {f['detail']}\n")
+                      rf.write(f"Evidence: {f['evidence']}\n")
+                      rf.write(f"URL: {f.get('url', TARGET)}\n")
+                      rf.write(f"Fix:\n{fix.get('fix','No fix available')}\n")
+                      rf.write("-"*40 + "\n")
+
+              os.system(f"git add {REPORT_FILE} && git commit -m 'God Mode scan: {TARGET}' && git push 2>/dev/null || true")
+              console.print(f"\n[green]📄 Report saved to {REPORT_FILE}[/green]")
+
+          console.print("\n[bold green]✅ VisionGuard God Mode scan completed![/bold green]")
           PYEOF
